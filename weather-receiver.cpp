@@ -2,38 +2,48 @@
 
 #include <Wire.h>
 #include <ESP8266WiFi.h>
-#include <RCSwitch.h>
+//#include <RCSwitch.h>
 #include <SPI.h>
 #include "CustomWiFiClient.h"
 #include <Adafruit_BMP280.h>
 #include <Blink.h>
 #include <PinReader.h>
-#include "DataColector.h"
+//#include "DataColector.h"
 #include <simpleDSTadjust.h>
 #include <JsonListener.h>
-#include "WundergroundClient.h"
-
+#include "OpenWeatherMapCurrent.h"
+#include "OpenWeatherMapForecast.h"
+#include <ArduinoJson.h>
 #include <SSD1306Wire.h>
 #include <OLEDDisplayUi.h>
 #include "WeatherStationFonts.h"
 #include "WeatherStationImages.h"
 
-#include <PubSubClient.h>
+#define USE_ARDUINO_OTA true
+
+#ifdef USE_ARDUINO_OTA
+#include <ArduinoOTA.h>
+#endif
+
+#include <MQTT.h>
+
+#define HOSTNAME "nodemcu-weather-station"
+
+#define TOPIC_TEMP "influx/weather/temp"
+#define TOPIC_HUM "influx/weather/hum"
+#define TOPIC_LIGHT "influx/weather/light"
+#define TOPIC_PRESS "influx/weather/press"
+#define TOPIC_VCC "influx/energy/vcc"
+#define TOPIC_DOOR "influx/home/door"
+#define TOPIC_BELL "influx/home/bell"
 
 #define RX_PIN D6
-
-#define SENSORDATA_JSON_SIZE (JSON_OBJECT_SIZE(4))
-
-const uint8_t BUFFER_SIZE = 32;
-uint8_t buffer[BUFFER_SIZE];
-
-#define MAX_DATA_SIZE 32
 
 Blink blinker(D0);
 
 const int UPDATE_INTERVAL_SECS = 60 * 60; // Update time and weather (every 1 hour)
 
-const long READING_INTERVAL = 15 * 60 * 1000; // sensor sending interval (15 minutes)
+const long READING_INTERVAL = 30 * 60 * 1000; // sensor sending interval (30 minutes)
 
 // Display Settings
 const int I2C_DISPLAY_ADDRESS = 0x3c;
@@ -57,40 +67,54 @@ bool frameAutoTransition = true; // frame transition state
 
 Adafruit_BMP280 bme; // I2C
 
-// Wunderground Settings
-const boolean IS_METRIC = true;
-const String WUNDERGRROUND_LANGUAGE = "EN"; // CZ
-const String WUNDERGROUND_ZMW_CODE = "00000.2.11538";
+String OPEN_WEATHER_MAP_LANGUAGE = "en"; // de | cz
+const uint8_t MAX_FORECASTS = 4;
 
-// Initialize Wunderground client with METRIC setting
-WundergroundClient wunderground(IS_METRIC);
+const boolean IS_METRIC = true;
+
+// Adjust according to your language
+//const String WDAY_NAMES[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+const String WDAY_NAMES[] = {"NED", "PON", "UTE", "STR", "CTV", "PAT", "SOB"};
+//const String MONTH_NAMES[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+const String MONTH_NAMES[] = {"LED", "UNO", "BRE", "DUB", "KVE", "CER", "CRC", "SRP", "ZAR", "RIJ", "LIS", "PRO"};
+
+// due to wierd indoor temparature measurement 
+const float inTempCorrection = -2.4;
+
+OpenWeatherMapCurrentData currentWeather;
+OpenWeatherMapCurrent currentWeatherClient;
+
+OpenWeatherMapForecastData forecasts[MAX_FORECASTS];
+OpenWeatherMapForecast forecastClient;
 
 Ticker tickerUpdateData;
 
 bool readyForUpdate = false;
 unsigned long dataReceived = 0;  // last time data was received
-unsigned long dataReceivedUiTime = 100; // how long should be data receiving indicated (ms)
+unsigned long dataReceivedUiTime = 200; // how long should be data receiving indicated (ms)
 
 void drawDateTime(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y);
 void drawCurrentWeather(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y);
-void drawGraph(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y);
+//void drawGraph(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y);
 void drawForecast(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y);
 void drawHeaderOverlay(OLEDDisplay *display, OLEDDisplayUiState* state);
 
-FrameCallback frames[] = { drawDateTime, drawCurrentWeather, drawForecast, drawGraph };
-int numberOfFrames = 4;
+//FrameCallback frames[] = { drawDateTime, drawCurrentWeather, drawForecast, drawGraph };
+FrameCallback frames[] = { drawDateTime, drawCurrentWeather, drawForecast };
+
+int numberOfFrames = 3;
 
 OverlayCallback overlays[] = { drawHeaderOverlay };
 int numberOfOverlays = 1;
 
-DataColector pressureDataColector;
-DataColector tempDataColector;
+//DataColector pressureDataColector;
+//DataColector tempDataColector;
 
-RCSwitch mySwitch = RCSwitch();
+//RCSwitch mySwitch = RCSwitch();
 
 WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-IPAddress mqttServer(10, 10, 10, 20);
+MQTTClient mqttClient;
+const char * mqttServer = "10.10.10.20";
 const int mqttPort = 1883;
 unsigned long mqttLastReconnectAttempt = 0;
 
@@ -107,7 +131,6 @@ struct MyData {
   unsigned long lastSent;         // last time data was sent to cloud
   unsigned long sentCount = 0;    // counting data sent
   bool sent;
-  
 };
 
 MyData lastData;
@@ -115,23 +138,29 @@ MyData lastData;
 unsigned long lastRefreshUi = 0;
 const unsigned long sendingInterval = 1000 * 60 * 15;  // send to cloud every 15 minutes 
 
+unsigned long doorOpened = 0;
+unsigned long doorClosed = 0;
+const unsigned long doorClosedHideTime = 1000 * 10;  // hide notification after 10 secs
+unsigned long doorBellRing = 0;
+const unsigned long doorBellRingHideTime = 1000 * 10;  // hide notification after 10 secs
+
 bool wifiConnect() {
   int timeout = 100;
   Serial.print(F("Connecting to "));
   Serial.println(Constants::SSID());
   drawProgress(&display, 0, F("Connecting to WiFi..."));
   
-  WiFi.hostname("ESPWeather");
+  WiFi.hostname(HOSTNAME);
 
   WiFi.begin(Constants::SSID(), Constants::WIFI_PW());
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(200);
-    Serial.print(F("."));
+    Serial.print(".");
     drawProgress(&display, 100-timeout, F("Connecting to WiFi..."));
     timeout--;
     if (timeout <= 0) {
-      Serial.println(F("WiFi connect timeout!"));
+      Serial.println("WiFi connect timeout!");
       drawProgress(&display, 100, F("WiFi connect timeout"));
       return false;
     }
@@ -139,43 +168,147 @@ bool wifiConnect() {
   Serial.println();
   Serial.println(F("WiFi connected!"));
   Serial.print(F("IP Address: "));
-  Serial.println(WiFi.localIP());
+  Serial.println(WiFi.localIP().toString().c_str());
   drawProgress(&display, 100, F("WiFi connected"));
   return true;
 }
 
 void mqttReconnect() {
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - mqttLastReconnectAttempt > 5000) {
-      mqttLastReconnectAttempt = now;
-      // Attempt to reconnect
-      //drawProgress(&display, 50, F("Connecting to MQTT..."));
-      Serial.print(F("Attempting MQTT connection..."));
-      // Attempt to connect
-      if (mqttClient.connect("ESP8266Client")) {
-        Serial.println("connected");
-        mqttLastReconnectAttempt = 0;
-      } else {
-        Serial.print("failed, rc=");
-        Serial.print(mqttClient.state());
-        Serial.println(" try again in 5 seconds");
-      }
-    }
-  } else {
-    // Client connected
-    mqttClient.loop();
+  Serial.print("MQTT connecting...");
+  while (!mqttClient.connect(HOSTNAME)) {
+    Serial.print(".");
+    delay(100);
   }
+
+  Serial.println();
+  Serial.println("MQTT subscribing topics...");
+  
+  mqttClient.subscribe(TOPIC_TEMP);
+  mqttClient.subscribe(TOPIC_HUM);
+  mqttClient.subscribe(TOPIC_PRESS);
+  mqttClient.subscribe(TOPIC_LIGHT);
+  mqttClient.subscribe(TOPIC_VCC);
+  mqttClient.subscribe(TOPIC_DOOR);
+  mqttClient.subscribe(TOPIC_BELL);
+
+  Serial.println("MQTT connected!");
+}
+
+void mqttCallback(String &topic, String &payload) {
+  String msg = payload;
+  Serial.print(F("Message arrived ["));
+  Serial.print(topic);
+  Serial.print(F("]: "));
+  Serial.println(msg);
+
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, msg);
+//  StaticJsonBuffer<200> jsonBuffer;
+  JsonObject& root = doc.as<JsonObject>();
+//  JsonObject& root = jsonBuffer.parseObject(msg);
+
+  // Test if parsing succeeds.
+  //if (!root.success()) {
+  if (error) {
+    Serial.println(F("parseObject() failed"));
+    return;
+  }
+
+  String topicJson = root["topic"];
+  String meterJson = root["meter"];
+  String devJson = root["dev"];
+  double valueJson = root["value"];
+
+  Serial.print(F("Topic: "));
+  Serial.print(topicJson);
+  Serial.print(F(", Meter: "));
+  Serial.print(meterJson);
+  Serial.print(F(", Device: "));
+  Serial.print(devJson);
+  Serial.print(F(", Value: "));
+  Serial.println(valueJson);
+
+  if (meterJson == "home" && topicJson == "door") {
+    if (valueJson > 0.0) {
+      doorOpened = millis();
+      doorClosed = 0;
+    } else {
+      doorOpened = 0;
+      doorClosed = millis();
+    }
+  }
+
+  if (meterJson == "home" && topicJson == "bell") {
+    if (valueJson > 0.0) {
+      doorBellRing = millis();
+    }
+  }
+  
+  unsigned long originalLastUpdate = lastData.lastUpdate; 
+  if (topicJson == "weather" && devJson == "wemos-weather") {
+    if (meterJson == "temp") {
+      lastData.outTemp = valueJson;
+      lastData.lastUpdate = millis();
+    }
+    if (meterJson == "hum") {
+      lastData.hum = valueJson;
+      lastData.lastUpdate = millis();
+    }
+    if (meterJson == "press") {
+      lastData.pressure = valueJson;
+      lastData.lastUpdate = millis();
+    }
+  } else if (topicJson == "energy" && devJson == "wemos-weather") {
+    if (meterJson == "vcc") {
+      lastData.vcc = valueJson;
+      lastData.lastUpdate = millis();
+    }
+  }
+
+  if (originalLastUpdate == lastData.lastUpdate) {
+    // no appropriate data received
+    Serial.println(F("No data to collect"));
+    return;
+  }
+
+  setDataReceived(&display, millis());
+
+  getInsideTempData(lastData);
+  getTimestamp(lastData);
+
+  Serial.print(F("Current data: outT="));
+  Serial.print(lastData.outTemp);
+  Serial.print(F(", inT="));
+  Serial.print(lastData.inTemp);
+  Serial.print(F(", outHum="));
+  Serial.print(lastData.hum);
+  Serial.print(F(", press="));
+  Serial.print(lastData.pressure);
+  Serial.print(F(", vcc="));
+  Serial.print(lastData.vcc);
+  Serial.print(F(", ts="));
+  Serial.println(lastData.timestamp.c_str());
+/*
+  if (lastData.sent && ((lastData.sentCount+1) % 2 == 0)) { // log every other data to extent history to 30hours back (for graph)
+    tempDataColector.add((int)(lastData.outTemp * 100));
+    pressureDataColector.add((int)(lastData.pressure * 100));
+    Serial.println(F("Data logged to internal history."));
+  } else {
+    Serial.println(F("Data not logged to internal history."));
+  }
+*/
+  lastData.sent = false;
 }
 
 void getInsideTempData(MyData& data) {
 //  Serial.print(bme.readTemperature());
 //  Serial.print(bme.readAltitude(1020.4)); // this should be adjusted to your local forcase
-  float temp = bme.readTemperature();
+  float temp = bme.readTemperature() + inTempCorrection;
   float pressure = bme.readPressure();
   pressure /= 100; // convert to hPa
   data.inTemp = temp;
-  data.pressure = relPressure(data.outTemp, pressure);
+//  data.pressure = relPressure(data.outTemp, pressure);
+  data.pressure = pressure;
 }
 
 // prepocet na relativni tlak dle umisteni
@@ -195,27 +328,13 @@ void getTimestamp(MyData& data) {
 }
 
 void send(MyData& data) {
+  getInsideTempData(lastData);
+  getTimestamp(lastData);
+  
   // MQTT
   if (mqttClient.connected()) {
-    String m = "temp,meter=outside,dev=1 value=";
-    m += data.outTemp;
-    mqttClient.publish("influx/weather/temp", m.c_str());
-
-    m = "temp,meter=inside,dev=2 value=";
-    m += data.inTemp;
-    mqttClient.publish("influx/weather/temp", m.c_str());
-    
-    m = "hum,meter=outside,dev=1 value=";
-    m += data.hum;
-    mqttClient.publish("influx/weather/hum", m.c_str());
-
-    m = "press,meter=outside,dev=2 value=";
-    m += data.pressure;
-    mqttClient.publish("influx/weather/press", m.c_str());
-    
-    m = "vcc,meter=outside,dev=1 value=";
-    m += data.vcc;
-    mqttClient.publish("influx/weather/vcc", m.c_str());
+    mqttPublish(TOPIC_TEMP, createJson("weather", "temp", data.inTemp));
+    mqttPublish(TOPIC_PRESS, createJson("weather", "press", data.pressure));
   }
   // HTTP client
   CustomWiFiClient client;
@@ -240,42 +359,6 @@ void handleDataSent(int httpResult) {
    blinker.start();
 }
 
-unsigned long deserializeRadioData(MyData& data, unsigned long value) {
-  Serial.print(F("Received data: "));
-  Serial.println(value);
-
-  if (value == 0) {
-    Serial.println(F("Unknown data received"));
-  } else if (value <= 256) {
-	  Serial.print(F("Received packetId data: "));
-	  Serial.println(value);
-	  data.packetId = value;
-  } else { // parsing weather data
-	  int rt = value / 1000000;
-	  int rh = (value - (rt *1000000)) / 1000;
-	  int rVcc = value - (rt *1000000) - (rh * 1000);
-	  float tDecoded = (rt - 500) / 10.0;
-	  float hDecoded = rh / 10.0;
-	  float vccDecoded = rVcc / 100.0;
-	
-	  data.outTemp = tDecoded;
-	  data.hum = hDecoded;
-	  data.vcc = vccDecoded;
-	
-	  data.lastUpdate = millis();
-	
-	  Serial.print(F("Received weather data: "));
-    Serial.print(F(" outT="));
-    Serial.print(data.outTemp);
-    Serial.print(F(" h="));
-    Serial.print(data.hum);
-    Serial.print(F(" vcc="));
-    Serial.println(data.vcc);
-  }
-  
-  return value;
-}
-
 void handleButtonSwitch(int oldValue, int newValue) {
   if (newValue == LOW) {
     if (frameAutoTransition) {
@@ -291,7 +374,7 @@ void handleButtonSwitch(int oldValue, int newValue) {
 }
 
 void setupRadio() {
-  mySwitch.enableReceive(RX_PIN);
+//  mySwitch.enableReceive(RX_PIN);
 }
 
 void setupDisplay() {
@@ -335,12 +418,14 @@ void setupUi() {
 
 void checkWifiConnected() {
   // restart if wifi not connected for some time
-  for (int i = 0; i < 50; i++) { // 5 secs timeout checking for connection
+  for (int i = 0; i < 50; i++) {
     if (WiFi.status() != WL_CONNECTED) {
-      delay(100);
-      continue;
+      if (wifiConnect()) {
+        return;
+      }
+    } else {
+      return;
     }
-    return; // connected
   }
 
   ESP.reset(); // restart
@@ -348,66 +433,39 @@ void checkWifiConnected() {
 }
 
 void checkMqttConnected() {
+  mqttClient.loop();
+  delay(10);  // <- fixes some issues with WiFi stability
   if (!mqttClient.connected()) {
     mqttReconnect();
   }
 }
 
-void checkDataReceived() {
-  if (mySwitch.available()) {
-    setDataReceived(&display, millis());
-    Serial.println(F("Message received..."));
+String createJson(String topic, String meter, float value) {
+  // {"topic" : "weather", "meter" : "temp", "dev" : "wemos-weather", "value" : 0.01}
+  String result = "{\"topic\" : \"";
+  result += topic;
+  result += "\", \"meter\" : \"";
+  result += meter;
+  result += "\", \"dev\" : \"";
+  result += HOSTNAME;
+  result += "\", \"value\" : ";
+  result += value;
+  result += "}";
+  return result;
+}
 
-    unsigned long value = mySwitch.getReceivedValue();
-    
-    if (value == 0) {
-      Serial.print("Unknown encoding");
-    } else {
-      Serial.print("Received ");
-      Serial.print( mySwitch.getReceivedValue() );
-      Serial.print(" / ");
-      Serial.print( mySwitch.getReceivedBitlength() );
-      Serial.print("bit ");
-      Serial.print("Protocol: ");
-      Serial.println( mySwitch.getReceivedProtocol() );
-    }
-
-    unsigned long result = deserializeRadioData(lastData, value); 
-    if (result > 256) {
-      getInsideTempData(lastData);
-
-      getTimestamp(lastData);
-	  
-      Serial.print(F("Updated internal data: "));
-      Serial.print(F(" inT="));
-      Serial.print(lastData.inTemp);
-      Serial.print(F(" p="));
-      Serial.print(lastData.pressure);
-      Serial.print(F(" ts="));
-      Serial.println(lastData.timestamp);
-      
-      if (lastData.sent && ((lastData.sentCount+1) % 2 == 0)) { // log every other data to extent history to 30hours back (for graph)
-        tempDataColector.add((int)(lastData.outTemp * 100));
-        pressureDataColector.add((int)(lastData.pressure * 100));
-        Serial.print(F("Data logged to internal history."));
-      } else {
-        Serial.print(F("Data not logged to internal history."));
-      }
-
-      Serial.print(F("Temperature collection: "));
-      tempDataColector.print();
-      Serial.print(F("Pressure collection: "));
-      pressureDataColector.print();
-
-      lastData.sent = false;
-      
-    } else if (result == 0) {
-      drawProgress(&display, 100, F("Failed receiving message, unknown message format"));
-      Serial.println(F("FAIL"));
-    }
-
-    mySwitch.resetAvailable();
+bool mqttPublish(char *topic, String msg) {
+  if (mqttClient.connected()) {
+    mqttClient.publish(topic, msg.c_str());
+    Serial.print(F("MQTT data sent: "));
+    Serial.println(msg.c_str());
   }
+}
+
+void setupOTA() {
+  String hostname(HOSTNAME);
+  ArduinoOTA.setHostname((const char *)hostname.c_str());
+  ArduinoOTA.begin();
 }
 
 void setup() {
@@ -415,19 +473,21 @@ void setup() {
 
   blinker.stop();
 
+ #ifdef USE_ARDUINO_OTA
+    setupOTA();
+  #endif
+  
   setupDisplay();
   setupUi();
 
 //  CustomWiFiManager::start(&blinker);
 
-  if (!wifiConnect()) {
-    ESP.reset(); // restart
-    delay(1000);
-  }
+  wifiConnect();
 
-  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.begin(mqttServer, mqttPort, espClient);
+  mqttClient.onMessage(mqttCallback);
   
-  setupRadio();
+//  setupRadio();
 
   if (!bme.begin()) {  
     Serial.println(F("Could not find a valid BMP280 sensor, check wiring!"));
@@ -448,10 +508,14 @@ void setup() {
 }
 
 void loop(void) {
-  checkDataReceived();
-  
   checkWifiConnected();
   checkMqttConnected();
+
+  #ifdef USE_ARDUINO_OTA
+    ArduinoOTA.handle();
+  #endif
+  
+  yield();
 
   buttonReader.monitorChanges();
   
@@ -472,10 +536,12 @@ void loop(void) {
     // time budget.
 
     if (remainingTimeBudget > 10) {
-      checkDataReceived();
+//      if (!mqttClient.loop()) {
+//        mqttReconnect();
+//      }
     }
 
-    delay(remainingTimeBudget);
+//    delay(remainingTimeBudget);
   }
 
 }
@@ -493,13 +559,21 @@ void drawProgress(OLEDDisplay *display, int percentage, String label) {
 }
 
 void updateData(OLEDDisplay *display) {
+  Serial.println(F("Updating internet data (time, weather)..."));
   drawProgress(display, 30, F("Updating time..."));
   configTime(UTC_OFFSET * 3600, 0, NTP_SERVERS);
-  drawProgress(display, 60, F("Updating conditions..."));
-  wunderground.updateConditions(Constants::WUNDERGRROUND_API_KEY(), WUNDERGRROUND_LANGUAGE, WUNDERGROUND_ZMW_CODE);
+  drawProgress(display, 60, F("Updating weather..."));
+  currentWeatherClient.setMetric(IS_METRIC);
+  currentWeatherClient.setLanguage(OPEN_WEATHER_MAP_LANGUAGE);
+  currentWeatherClient.updateCurrentById(&currentWeather, Constants::OPEN_WEATHER_MAP_APP_ID(), Constants::OPEN_WEATHER_MAP_LOCATION_ID());
   drawProgress(display, 80, F("Updating forecasts..."));
-  wunderground.updateForecastZMW(Constants::WUNDERGRROUND_API_KEY(), WUNDERGRROUND_LANGUAGE, WUNDERGROUND_ZMW_CODE);
+  forecastClient.setMetric(IS_METRIC);
+  forecastClient.setLanguage(OPEN_WEATHER_MAP_LANGUAGE);
+  uint8_t allowedHours[] = {12};
+  forecastClient.setAllowedHours(allowedHours, sizeof(allowedHours));
+  forecastClient.updateForecastsById(forecasts, Constants::OPEN_WEATHER_MAP_APP_ID(), Constants::OPEN_WEATHER_MAP_LOCATION_ID(), MAX_FORECASTS);
   readyForUpdate = false;
+  Serial.println(F("Updating internet data - DONE"));
 }
 
 void drawDateTime(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
@@ -538,8 +612,23 @@ void drawCurrentWeather(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t
   char temp_str[8];
   sprintf(temp_str, "%d.%1d°C\n", (int)lastData.outTemp, abs((int)(lastData.outTemp*10)%10));
   display->drawString(64 + x, 16 + y, temp_str);
-}
 
+  // data from forecast
+  time_t observationTimestamp = forecasts[dayIndex].observationTime;
+  struct tm* timeInfo;
+  timeInfo = localtime(&observationTimestamp);
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(ArialMT_Plain_10);
+  display->drawString(x + 20, y, WDAY_NAMES[timeInfo->tm_wday]);
+
+  display->setFont(Meteocons_Plain_21);
+  display->drawString(x + 20, y + 12, forecasts[dayIndex].iconMeteoCon);
+  String temp = String(forecasts[dayIndex].temp, 0) + (IS_METRIC ? "°C" : "°F");
+  display->setFont(ArialMT_Plain_10);
+  display->drawString(x + 20, y + 34, temp);
+  display->setTextAlignment(TEXT_ALIGN_LEFT);
+}
+/*
 void drawGraph(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
   display->setFont(ArialMT_Plain_10);
 
@@ -609,7 +698,7 @@ void drawGraph(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16
   
 //  free(data);
 }
-
+*/
 void drawForecast(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, int16_t y) {
   drawForecastDetails(display, x, y, 0);
   drawForecastDetails(display, x + 44, y, 2);
@@ -617,20 +706,56 @@ void drawForecast(OLEDDisplay *display, OLEDDisplayUiState* state, int16_t x, in
 }
 
 void drawForecastDetails(OLEDDisplay *display, int x, int y, int dayIndex) {
+  time_t observationTimestamp = forecasts[dayIndex].observationTime;
+  struct tm* timeInfo;
+  timeInfo = localtime(&observationTimestamp);
   display->setTextAlignment(TEXT_ALIGN_CENTER);
   display->setFont(ArialMT_Plain_10);
-  String day = wunderground.getForecastTitle(dayIndex).substring(0, 3);
-  day.toUpperCase();
-  display->drawString(x + 20, y, day);
+  display->drawString(x + 20, y, WDAY_NAMES[timeInfo->tm_wday]);
 
   display->setFont(Meteocons_Plain_21);
-  display->drawString(x + 20, y + 12, wunderground.getForecastIcon(dayIndex));
-
+  display->drawString(x + 20, y + 12, forecasts[dayIndex].iconMeteoCon);
+  String temp = String(forecasts[dayIndex].temp, 0) + (IS_METRIC ? "°C" : "°F");
   display->setFont(ArialMT_Plain_10);
-  display->drawString(x + 20, y + 34, wunderground.getForecastLowTemp(dayIndex) + "|" + wunderground.getForecastHighTemp(dayIndex));
+  display->drawString(x + 20, y + 34, temp);
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 }
 
+void drawHomeOverlay(OLEDDisplay *display, int16_t x, int16_t y) {
+  bool doorO = doorOpened > 0;
+  bool doorC = doorClosed > 0 && millis() - doorClosed < doorClosedHideTime;
+  bool doorBell = doorBellRing > 0 && millis() - doorBellRing < doorBellRingHideTime;
+
+  if (doorO || doorC || doorBell) {
+    // clear screen
+    display->setColor(BLACK);
+    display->fillRect(0, 0, display->getWidth(), display->getHeight());
+  }
+  
+  if (doorO) {
+    overlayText(display, x, doorBell ? y+5 : y+15, "OTEVRENO!");
+  } else if (doorC) {
+    overlayText(display, x, doorBell ? y+5 : y+15, "ZAVRENO");
+  } else {
+    doorOpened = 0;
+    doorClosed = 0;
+  }
+
+  if (doorBell) {
+    overlayText(display, x, doorO || doorC ? y+30 : y+15, "ZVONEK!");
+  } else {
+    doorBellRing = 0;
+  }
+}
+
+void overlayText(OLEDDisplay *display, int16_t x, int16_t y, char * text) {
+  display->setColor(WHITE);
+  display->setTextAlignment(TEXT_ALIGN_CENTER);
+  display->setFont(ArialMT_Plain_16);
+
+  display->drawString(x, y, text);
+}
+/*
 void drawPressureIcon(OLEDDisplay *display, int16_t x, int16_t y) {
   display->setColor(WHITE);
   if (pressureDataColector.isAscending()) {
@@ -651,7 +776,7 @@ void drawPressureIcon(OLEDDisplay *display, int16_t x, int16_t y) {
     display->drawHorizontalLine(x, 1+y, 10);
   }
 }
-
+*/
 void drawLastUpdate(OLEDDisplay *display, int16_t x, int16_t y) {
   display->setColor(WHITE);
   long lastUpdateX = map(millis() - lastData.lastUpdate, 0, READING_INTERVAL, 0, 128); // 0 - 15min -> 0 - 128px
@@ -689,7 +814,7 @@ void drawHeaderOverlay(OLEDDisplay *display, OLEDDisplayUiState* state) {
     display->drawString(96, 54, temp_str);
   }
 
-  drawPressureIcon(display, 60, 60);
+//  drawPressureIcon(display, 60, 60);
   
   int8_t quality = getWifiQuality();
   for (int8_t i = 0; i < 4; i++) {
@@ -703,6 +828,8 @@ void drawHeaderOverlay(OLEDDisplay *display, OLEDDisplayUiState* state) {
   drawLastUpdate(display, 0, 52);
 
   drawDataReceived(display, 96, 52);
+
+  drawHomeOverlay(display, 64, 0);
 
   display->drawHorizontalLine(0, 52, 128);
 }
