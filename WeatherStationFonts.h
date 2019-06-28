@@ -25,7 +25,7 @@ See more at http://blog.squix.ch
 #define FONT_LIB_V3
 // Created by http://oleddisplay.squix.ch/ Consider a donation
 // In case of problems make sure that you are using the font file with the correct version!
-const char Meteocons_Plain_21[] PROGMEM = {
+const uint8_t Meteocons_Plain_21[] PROGMEM = {
   0x15, // Width: 21
   0x16, // Height: 22
   0x20, // First Char: 32

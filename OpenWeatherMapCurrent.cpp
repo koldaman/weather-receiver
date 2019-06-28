@@ -21,9 +21,9 @@
  SOFTWARE.
  */
 
-#include <ESPWiFi.h>
+#include <ESP8266WiFi.h>
 #include <WiFiClient.h>
-#include <ESPHTTPClient.h>
+#include <ESP8266HTTPClient.h>
 #include "OpenWeatherMapCurrent.h"
 
 OpenWeatherMapCurrent::OpenWeatherMapCurrent() {
